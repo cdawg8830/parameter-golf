@@ -61,11 +61,18 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    # Depth recurrence: num_unique_layers blocks are each reused loop_count times,
+    # giving num_unique_layers * loop_count total effective transformer depth.
+    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 3))
+    loop_count = int(os.environ.get("LOOP_COUNT", 6))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
+    num_heads = int(os.environ.get("NUM_HEADS", 12))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+
+    @property
+    def num_layers(self) -> int:
+        return self.num_unique_layers * self.loop_count
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -649,7 +656,8 @@ class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        num_layers: int,
+        num_unique_layers: int,
+        loop_count: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -666,11 +674,14 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.loop_count = loop_count
+        num_layers = num_unique_layers * loop_count
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        # Only num_unique_layers blocks are created; they are reused loop_count times in forward.
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -681,7 +692,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for i in range(num_unique_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -703,14 +714,21 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        # Loop the unique blocks loop_count times for full effective depth.
+        # U-Net skip pattern spans the total effective depth: the first half of
+        # effective layers accumulate skips, the second half consume them in reverse.
+        effective_idx = 0
+        for _ in range(self.loop_count):
+            for block in self.blocks:
+                if effective_idx < self.num_encoder_layers:
+                    x = block(x, x0)
+                    skips.append(x)
+                else:
+                    if skips:
+                        skip_i = effective_idx - self.num_encoder_layers
+                        x = x + self.skip_weights[skip_i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                    x = block(x, x0)
+                effective_idx += 1
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -825,7 +843,8 @@ def main() -> None:
 
     base_model = GPT(
         vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
+        num_unique_layers=args.num_unique_layers,
+        loop_count=args.loop_count,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
