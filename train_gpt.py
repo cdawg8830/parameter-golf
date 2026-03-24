@@ -56,6 +56,10 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    # EVAL_SEQ_LEN controls context length for the final int8 roundtrip evaluation only.
+    # Longer context at eval time is free (no retraining) -- RoPE extends naturally.
+    # Defaults to train_seq_len (0 = use train_seq_len).
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 0))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -1116,6 +1120,17 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+
+    # EVAL_SEQ_LEN allows evaluating the final int8 model at a longer context than training.
+    # RoPE extends naturally; longer context generally improves BPB at zero training cost.
+    final_eval_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+    if final_eval_seq_len != args.train_seq_len:
+        log0(f"final_eval:extended_context train_seq_len:{args.train_seq_len} eval_seq_len:{final_eval_seq_len}")
+        eval_val_tokens = load_validation_tokens(args.val_files, final_eval_seq_len)
+        args.train_seq_len = final_eval_seq_len  # instance-level override for eval_val
+    else:
+        eval_val_tokens = val_tokens
+
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1125,7 +1140,7 @@ def main() -> None:
         world_size,
         device,
         grad_accum_steps,
-        val_tokens,
+        eval_val_tokens,
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
